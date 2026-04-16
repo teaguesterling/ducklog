@@ -61,13 +61,22 @@ erDiagram
         varchar comparison
     }
 
+    ENTITIES ||--o{ ENTITY_CLOSURE : "ancestor/descendant"
     ENTITIES {
         int id PK
         varchar taxon FK
         varchar type_name
         varchar entity_id "#id value"
         varchar[] classes
-        json attrs
+        map attributes "MAP(VARCHAR,VARCHAR)"
+        int parent_id FK "adjacency list"
+        int depth
+    }
+
+    ENTITY_CLOSURE {
+        int ancestor_id PK, FK
+        int descendant_id PK, FK
+        int depth "0=self 1=child etc"
     }
 
     RULES {

@@ -105,12 +105,79 @@ CREATE TABLE entities (
     type_name       VARCHAR NOT NULL,
     entity_id       VARCHAR,            -- #id value (file path, tool name, etc.)
     classes         VARCHAR[],          -- class labels (for mode.implement.tdd → ['implement', 'tdd'])
-    attrs           JSON,               -- attribute bag: {"path": "/src/auth.py", "language": "python"}
+    attributes      MAP(VARCHAR, VARCHAR),  -- typed attribute bag: {path: /src/auth.py, language: python}
+    -- Hierarchy (adjacency list — source of truth for parent-child)
+    parent_id       INTEGER REFERENCES entities(id),
+    depth           INTEGER DEFAULT 0,  -- 0 = root, 1 = child of root, etc.
 );
 
 CREATE INDEX idx_entities_taxon ON entities(taxon);
 CREATE INDEX idx_entities_type ON entities(type_name);
 CREATE INDEX idx_entities_id ON entities(entity_id);
+CREATE INDEX idx_entities_parent ON entities(parent_id);
+
+
+-- ============================================================================
+-- 3a. HIERARCHY — pre-computed transitive closure for fast descendant queries
+-- ============================================================================
+
+-- The closure table: one row per (ancestor, descendant) pair, including self.
+-- Rebuilt when the entity set changes (after matcher population, before cascade).
+CREATE TABLE entity_closure (
+    ancestor_id     INTEGER NOT NULL REFERENCES entities(id),
+    descendant_id   INTEGER NOT NULL REFERENCES entities(id),
+    depth           INTEGER NOT NULL,   -- 0 = self, 1 = direct child, 2 = grandchild, etc.
+    PRIMARY KEY (ancestor_id, descendant_id),
+);
+
+CREATE INDEX idx_closure_ancestor ON entity_closure(ancestor_id);
+CREATE INDEX idx_closure_descendant ON entity_closure(descendant_id);
+
+-- Populate the closure table from the adjacency list.
+-- Run this after all entities are inserted.
+--
+-- This is the one place WITH RECURSIVE appears in the core schema.
+-- Everything else queries the closure table directly (no recursion at query time).
+CREATE OR REPLACE MACRO rebuild_closure() AS TABLE (
+    WITH RECURSIVE closure(ancestor_id, descendant_id, depth) AS (
+        -- Base: every entity is its own ancestor at depth 0
+        SELECT id, id, 0
+        FROM entities
+        UNION ALL
+        -- Step: walk up via parent_id
+        SELECT c.ancestor_id, e.id, c.depth + 1
+        FROM closure c
+        JOIN entities e ON e.parent_id = c.descendant_id
+    )
+    SELECT * FROM closure
+);
+
+-- Convenience views over the closure table
+
+-- All descendants of an entity (including itself)
+CREATE OR REPLACE MACRO descendants(root_id) AS TABLE (
+    SELECT e.*
+    FROM entity_closure ec
+    JOIN entities e ON e.id = ec.descendant_id
+    WHERE ec.ancestor_id = root_id
+    ORDER BY ec.depth
+);
+
+-- All ancestors of an entity (including itself)
+CREATE OR REPLACE MACRO ancestors(entity_id) AS TABLE (
+    SELECT e.*, ec.depth
+    FROM entity_closure ec
+    JOIN entities e ON e.id = ec.ancestor_id
+    WHERE ec.descendant_id = entity_id
+    ORDER BY ec.depth DESC
+);
+
+-- Direct children only
+CREATE OR REPLACE MACRO children(parent_entity_id) AS TABLE (
+    SELECT e.*
+    FROM entities e
+    WHERE e.parent_id = parent_entity_id
+);
 
 
 -- ============================================================================
