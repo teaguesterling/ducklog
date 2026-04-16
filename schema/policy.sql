@@ -185,7 +185,6 @@ CREATE OR REPLACE MACRO children(parent_entity_id) AS TABLE (
 -- ============================================================================
 
 -- Every (entity, selector) pair where the selector matched the entity.
--- This is the "candidate" set before winner selection.
 CREATE TABLE cascade_matches (
     entity_id       INTEGER NOT NULL REFERENCES entities(id),
     selector_id     INTEGER NOT NULL REFERENCES selectors(id),
@@ -194,42 +193,129 @@ CREATE TABLE cascade_matches (
 );
 
 -- Every (entity, property) candidate: one row per rule that could set this property.
+-- The `comparison` column determines HOW this candidate participates in resolution.
 CREATE TABLE cascade_candidates (
     entity_id       INTEGER NOT NULL REFERENCES entities(id),
     property_name   VARCHAR NOT NULL,
     property_value  VARCHAR NOT NULL,
+    comparison      VARCHAR NOT NULL DEFAULT 'exact',  -- resolution strategy
     selector_id     INTEGER NOT NULL REFERENCES selectors(id),
     rule_id         INTEGER NOT NULL REFERENCES rules(id),
     specificity     INTEGER[] NOT NULL,
     rule_index      INTEGER NOT NULL,   -- document order for tiebreaking
     source_file     VARCHAR,
     source_line     INTEGER,
-    is_winner       BOOLEAN NOT NULL DEFAULT false,
 );
 
 CREATE INDEX idx_candidates_entity_prop ON cascade_candidates(entity_id, property_name);
-CREATE INDEX idx_candidates_winner ON cascade_candidates(is_winner) WHERE is_winner = true;
+CREATE INDEX idx_candidates_comparison ON cascade_candidates(comparison);
 
 
 -- ============================================================================
--- 5. RESOLVED — the cascade winners (the queryable policy)
+-- 5. RESOLVED — comparison-aware cascade resolution
 -- ============================================================================
 
--- One row per (entity, property): the winning value after cascade resolution.
--- This is the primary table consumers query.
+-- Each comparison type has different resolution semantics:
+--
+-- | Comparison  | Strategy                          | Example                    |
+-- |-------------|-----------------------------------|----------------------------|
+-- | exact       | Highest specificity wins           | editable: true             |
+-- | <=          | Tightest bound (MIN of all values) | max-level: 2               |
+-- | >=          | Loosest floor (MAX of all values)  | min-budget: 256            |
+-- | pattern-in  | Set union of all matching rules    | allow-pattern: "git *"     |
+-- | in          | Set intersection                   | only-kits: python-dev      |
+-- | overlap     | Set union (any match suffices)     | any-of-effects: read,write |
+
+-- exact: highest specificity wins; document order breaks ties.
+CREATE VIEW _resolved_exact AS
+    SELECT DISTINCT ON (entity_id, property_name)
+        entity_id,
+        property_name,
+        property_value,
+        comparison,
+        specificity,
+        rule_index,
+        source_file,
+        source_line,
+    FROM cascade_candidates
+    WHERE comparison = 'exact'
+    ORDER BY entity_id, property_name, specificity DESC, rule_index DESC;
+
+-- <=: tightest bound wins. All candidates contribute; the minimum value is the bound.
+-- Provenance points to the rule that set the tightest bound.
+CREATE VIEW _resolved_cap AS
+    WITH ranked AS (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY entity_id, property_name
+                ORDER BY CAST(property_value AS INTEGER) ASC, specificity DESC
+            ) AS rn
+        FROM cascade_candidates
+        WHERE comparison = '<='
+    )
+    SELECT entity_id, property_name, property_value, comparison,
+           specificity, rule_index, source_file, source_line,
+    FROM ranked WHERE rn = 1;
+
+-- >=: loosest floor wins. All candidates contribute; the maximum value is the floor.
+CREATE VIEW _resolved_floor AS
+    WITH ranked AS (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY entity_id, property_name
+                ORDER BY CAST(property_value AS INTEGER) DESC, specificity DESC
+            ) AS rn
+        FROM cascade_candidates
+        WHERE comparison = '>='
+    )
+    SELECT entity_id, property_name, property_value, comparison,
+           specificity, rule_index, source_file, source_line,
+    FROM ranked WHERE rn = 1;
+
+-- pattern-in: union of all patterns from all matching rules.
+-- The resolved value is a comma-separated aggregate; provenance points
+-- to the highest-specificity contributor.
+CREATE VIEW _resolved_pattern AS
+    WITH agg AS (
+        SELECT
+            entity_id,
+            property_name,
+            STRING_AGG(DISTINCT property_value, ', ' ORDER BY property_value) AS property_value,
+            'pattern-in' AS comparison,
+            MAX(specificity) AS specificity,
+            MAX(rule_index) AS rule_index,
+        FROM cascade_candidates
+        WHERE comparison = 'pattern-in'
+        GROUP BY entity_id, property_name
+    )
+    SELECT a.entity_id, a.property_name, a.property_value, a.comparison,
+           a.specificity, a.rule_index,
+           c.source_file, c.source_line,
+    FROM agg a
+    JOIN cascade_candidates c
+        ON a.entity_id = c.entity_id
+        AND a.property_name = c.property_name
+        AND a.specificity = c.specificity
+        AND a.rule_index = c.rule_index
+        AND c.comparison = 'pattern-in';
+
+-- The unified resolved view: one row per (entity, property) after
+-- comparison-aware resolution.
 CREATE VIEW resolved_properties AS
-    SELECT
-        cc.entity_id,
-        cc.property_name,
-        cc.property_value,
-        cc.specificity,
-        cc.rule_index,
-        cc.source_file,
-        cc.source_line,
-    FROM cascade_candidates cc
-    WHERE cc.is_winner = true;
+    SELECT * FROM _resolved_exact
+    UNION ALL BY NAME
+    SELECT * FROM _resolved_cap
+    UNION ALL BY NAME
+    SELECT * FROM _resolved_floor
+    UNION ALL BY NAME
+    SELECT * FROM _resolved_pattern;
 
--- Convenience: entity + all its resolved properties as a JSON object.
+
+-- ============================================================================
+-- 5a. TYPED PROJECTIONS — consumer-friendly views per entity type
+-- ============================================================================
+
+-- Convenience: entity + all its resolved properties as a MAP.
 CREATE VIEW resolved_entities AS
     SELECT
         e.id,
@@ -237,11 +323,78 @@ CREATE VIEW resolved_entities AS
         e.type_name,
         e.entity_id,
         e.classes,
-        e.attrs,
-        json_group_object(rp.property_name, rp.property_value) AS properties,
+        e.attributes,
+        MAP(LIST(rp.property_name), LIST(rp.property_value)) AS properties,
     FROM entities e
     LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
-    GROUP BY e.id, e.taxon, e.type_name, e.entity_id, e.classes, e.attrs;
+    GROUP BY e.id, e.taxon, e.type_name, e.entity_id, e.classes, e.attributes;
+
+
+-- Files: world-axis resource properties pivoted to columns
+CREATE VIEW files AS
+    SELECT
+        e.id,
+        e.entity_id AS path,
+        e.attributes['name'] AS name,
+        e.attributes['language'] AS language,
+        e.parent_id,
+        MAX(CASE WHEN rp.property_name = 'editable' THEN rp.property_value END) AS editable,
+        MAX(CASE WHEN rp.property_name = 'visible' THEN rp.property_value END) AS visible,
+        MAX(CASE WHEN rp.property_name = 'show' THEN rp.property_value END) AS show_mode,
+    FROM entities e
+    LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
+    WHERE e.type_name = 'file'
+    GROUP BY e.id, e.entity_id, e.attributes, e.parent_id;
+
+
+-- Tools: capability-axis properties pivoted to columns
+CREATE VIEW tools AS
+    SELECT
+        e.id,
+        e.entity_id AS name,
+        e.attributes['altitude'] AS altitude,
+        MAX(CASE WHEN rp.property_name = 'allow' THEN rp.property_value END) AS allow,
+        MAX(CASE WHEN rp.property_name = 'visible' THEN rp.property_value END) AS visible,
+        MAX(CASE WHEN rp.property_name = 'max-level' THEN rp.property_value END) AS max_level,
+        MAX(CASE WHEN rp.property_name = 'allow-pattern' THEN rp.property_value END) AS allow_pattern,
+        MAX(CASE WHEN rp.property_name = 'deny-pattern' THEN rp.property_value END) AS deny_pattern,
+    FROM entities e
+    LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
+    WHERE e.type_name = 'tool'
+    GROUP BY e.id, e.entity_id, e.attributes;
+
+
+-- Modes: control-axis properties pivoted to columns
+CREATE VIEW modes AS
+    SELECT
+        e.id,
+        e.classes AS mode_classes,
+        MAX(CASE WHEN rp.property_name = 'writable' THEN rp.property_value END) AS writable,
+        MAX(CASE WHEN rp.property_name = 'strategy' THEN rp.property_value END) AS strategy,
+        MAX(CASE WHEN rp.property_name = 'description' THEN rp.property_value END) AS description,
+    FROM entities e
+    LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
+    WHERE e.type_name = 'mode'
+    GROUP BY e.id, e.classes;
+
+
+-- Uses: action-axis permission projections
+CREATE VIEW uses AS
+    SELECT
+        e.id,
+        e.attributes['of'] AS of_target,
+        e.attributes['of-kind'] AS of_kind,
+        e.attributes['of-like'] AS of_like,
+        MAX(CASE WHEN rp.property_name = 'editable' THEN rp.property_value END) AS editable,
+        MAX(CASE WHEN rp.property_name = 'visible' THEN rp.property_value END) AS visible,
+        MAX(CASE WHEN rp.property_name = 'allow' THEN rp.property_value END) AS allow,
+        MAX(CASE WHEN rp.property_name = 'deny' THEN rp.property_value END) AS deny,
+        MAX(CASE WHEN rp.property_name = 'allow-pattern' THEN rp.property_value END) AS allow_pattern,
+        MAX(CASE WHEN rp.property_name = 'deny-pattern' THEN rp.property_value END) AS deny_pattern,
+    FROM entities e
+    LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
+    WHERE e.type_name = 'use'
+    GROUP BY e.id, e.attributes;
 
 
 -- ============================================================================
@@ -264,61 +417,90 @@ CREATE VIEW transitions AS
     SELECT
         e.id,
         e.entity_id AS transition_id,
-        e.attrs->>'from' AS from_mode,
-        e.attrs->>'to' AS to_mode,
-        rp_run.property_value AS run_command,
-        rp_tier.property_value AS tier,
-        rp_phase.property_value AS phase,
-        rp_cond.property_value AS condition,
-        rp_adv.property_value AS advisory,
+        e.attributes['from'] AS from_mode,
+        e.attributes['to'] AS to_mode,
+        MAX(CASE WHEN rp.property_name = 'run' THEN rp.property_value END) AS run_command,
+        MAX(CASE WHEN rp.property_name = 'tier' THEN rp.property_value END) AS tier,
+        MAX(CASE WHEN rp.property_name = 'phase' THEN rp.property_value END) AS phase,
+        MAX(CASE WHEN rp.property_name = 'condition' THEN rp.property_value END) AS condition,
+        MAX(CASE WHEN rp.property_name = 'advisory' THEN rp.property_value END) AS advisory,
     FROM entities e
-    LEFT JOIN resolved_properties rp_run ON e.id = rp_run.entity_id AND rp_run.property_name = 'run'
-    LEFT JOIN resolved_properties rp_tier ON e.id = rp_tier.entity_id AND rp_tier.property_name = 'tier'
-    LEFT JOIN resolved_properties rp_phase ON e.id = rp_phase.entity_id AND rp_phase.property_name = 'phase'
-    LEFT JOIN resolved_properties rp_cond ON e.id = rp_cond.entity_id AND rp_cond.property_name = 'condition'
-    LEFT JOIN resolved_properties rp_adv ON e.id = rp_adv.entity_id AND rp_adv.property_name = 'advisory'
-    WHERE e.type_name = 'transition';
+    LEFT JOIN resolved_properties rp ON e.id = rp.entity_id
+    WHERE e.type_name = 'transition'
+    GROUP BY e.id, e.entity_id, e.attributes;
 
 
 -- ============================================================================
 -- 8. VERIFICATION ASSERTIONS — evaluation-framework claims as SQL
 -- ============================================================================
 
--- A1: resolver determinism — every (entity, property) has exactly one winner.
+-- A1: resolver determinism — every (entity, property) has exactly one resolved row.
 CREATE VIEW assert_a1_unique_winners AS
     SELECT entity_id, property_name, COUNT(*) AS winner_count
-    FROM cascade_candidates
-    WHERE is_winner = true
+    FROM resolved_properties
     GROUP BY entity_id, property_name
     HAVING winner_count > 1;
--- MUST return 0 rows.
+-- MUST return 0 rows. (pattern-in aggregates to one row; exact picks one winner.)
 
--- A2: cascade is well-ordered — no ties. Every winner has strictly higher
--- (specificity, rule_index) than all other candidates for the same (entity, property).
+-- A2: cascade is well-ordered for exact properties — no non-winner has
+-- higher precedence than the winner.
 CREATE VIEW assert_a2_no_ties AS
     SELECT
         w.entity_id,
         w.property_name,
         w.specificity AS winner_spec,
         c.specificity AS challenger_spec,
-        w.rule_index AS winner_order,
-        c.rule_index AS challenger_order,
-    FROM cascade_candidates w
+    FROM _resolved_exact w
     JOIN cascade_candidates c
         ON w.entity_id = c.entity_id
         AND w.property_name = c.property_name
-        AND w.selector_id != c.selector_id
-    WHERE w.is_winner = true
-      AND c.is_winner = false
-      AND (c.specificity > w.specificity
-           OR (c.specificity = w.specificity AND c.rule_index > w.rule_index));
--- MUST return 0 rows. Any row means a non-winner has higher precedence than the winner.
+        AND c.comparison = 'exact'
+        AND (c.specificity, c.rule_index) != (w.specificity, w.rule_index)
+    WHERE c.specificity > w.specificity
+       OR (c.specificity = w.specificity AND c.rule_index > w.rule_index);
+-- MUST return 0 rows.
 
--- C1: proof-tree traceability — every resolved property traces back to a source line.
+-- A5: comparison semantics — every resolved property's comparison matches
+-- the registered property_type comparison.
+CREATE VIEW assert_a5_comparison_match AS
+    SELECT rp.entity_id, rp.property_name, rp.comparison AS resolved_cmp,
+           pt.comparison AS registered_cmp,
+    FROM resolved_properties rp
+    JOIN entities e ON rp.entity_id = e.id
+    JOIN property_types pt
+        ON pt.taxon = e.taxon
+        AND pt.entity_type = e.type_name
+        AND pt.name = rp.property_name
+    WHERE rp.comparison != pt.comparison;
+-- MUST return 0 rows. Any row means a property was resolved with the wrong strategy.
+
+-- A6: world-axis and action-axis are independent — no file.editable
+-- candidate shares a selector with a use.editable candidate.
+-- (They resolve separately through different entity types.)
+CREATE VIEW assert_a6_axis_independence AS
+    SELECT DISTINCT 'file+use collision' AS issue,
+           fc.selector_id,
+           fc.property_name,
+    FROM cascade_candidates fc
+    JOIN entities fe ON fc.entity_id = fe.id AND fe.type_name = 'file'
+    JOIN cascade_candidates uc ON fc.selector_id = uc.selector_id
+    JOIN entities ue ON uc.entity_id = ue.id AND ue.type_name = 'use'
+    WHERE fc.property_name = uc.property_name
+      AND fc.property_name IN ('editable', 'visible', 'allow');
+-- MUST return 0 rows. A selector can't match both a file and a use entity
+-- (different type_names), so this should be structurally impossible.
+
+-- C1: proof-tree traceability — every resolved property traces to a source line.
 CREATE VIEW assert_c1_provenance AS
     SELECT entity_id, property_name
     FROM resolved_properties
     WHERE source_file IS NULL OR source_line IS NULL;
 -- MUST return 0 rows.
+
+-- D2: ratchet monotonicity check (run between two databases).
+-- See examples/03-diff-two-worlds.sql for the full diff query.
+-- The assertion: no widening should exist in a ratchet-produced diff.
+-- Widenings: editable false→true, allow false→true, deny "*"→"",
+--            max-level increasing, pattern set shrinking.
 
 -- H3: no enforcement-tool wrapper dependency (checked at build time, not in the DB).
