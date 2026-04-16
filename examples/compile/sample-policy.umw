@@ -1,0 +1,49 @@
+/* Policy for a Python project in a multi-mode development environment.
+   Demonstrates mixing sources: files from glob, tools from JSON, modes from TOML. */
+
+/* World-axis: resource-level properties */
+file[path^="src/"]    { editable: true; }
+file[path^="tests/"]  { editable: true; }
+file[path^="docs/"]   { editable: false; }
+file                   { editable: false; visible: true; }
+file[path$=".pyc"]    { visible: false; }
+file[path^=".git/"]   { visible: false; }
+
+network { deny: "*"; }
+resource[kind="memory"]    { limit: 512MB; }
+resource[kind="wall-time"] { limit: 5m; }
+
+/* Capability-axis: tool-level properties */
+tool { allow: true; max-level: 3; }
+tool[name="Bash"]  { allow-pattern: "git *", "pytest *", "python3 *", "ruff *"; }
+tool[name="Bash"]  { deny-pattern: "rm -rf *", "sudo *", "curl *"; }
+
+/* Mode-gated tool surfaces */
+mode.implement tool             { allow: true; }
+mode.implement tool[name="Bash"] { max-level: 4; }
+
+mode.explore tool               { allow: false; visible: false; }
+mode.explore tool[name="Read"]  { allow: true; visible: true; }
+mode.explore tool[name="Grep"]  { allow: true; visible: true; }
+mode.explore tool[name="Glob"]  { allow: true; visible: true; }
+
+mode.test tool                  { allow: true; }
+mode.test tool[name="Edit"]    { allow: false; }
+mode.test tool[name="Write"]   { allow: false; }
+mode.test tool[name="Bash"]    { allow-pattern: "pytest *", "python3 -m pytest *"; }
+
+mode.review tool                { allow: false; visible: false; }
+mode.review tool[name="Read"]  { allow: true; visible: true; }
+mode.review tool[name="Grep"]  { allow: true; visible: true; }
+mode.review tool[name="Glob"]  { allow: true; visible: true; }
+mode.review tool[name="Bash"]  { allow: true; allow-pattern: "git log *", "git diff *"; }
+
+/* Action-axis: per-resource access paths */
+use[of-kind="file"] { editable: false; }
+mode.implement use[of-like="file#src/"]   { editable: true; }
+mode.test use[of-like="file#tests/"]      { editable: true; }
+
+/* Audit */
+@audit {
+    observation#ratchet { source: "ratchet-detect"; enabled: true; }
+}

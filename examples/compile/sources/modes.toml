@@ -1,0 +1,22 @@
+# Mode definitions (kibitzer-style)
+# Each mode carries writable paths and an optional strategy instruction.
+
+[modes.implement]
+writable = ["src/", "lib/"]
+strategy = ""
+
+[modes.test]
+writable = ["tests/", "test/"]
+strategy = "Write tests for expected behavior, not current behavior."
+
+[modes.explore]
+writable = []
+strategy = "Map the territory before making changes."
+
+[modes.review]
+writable = []
+strategy = "Read everything, then verify with tests."
+
+[modes.docs]
+writable = ["docs/", "README.md"]
+strategy = "Explain the why, not the what."

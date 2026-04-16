@@ -1,0 +1,13 @@
+{
+  "tools": [
+    {"name": "Read",       "altitude": "os",       "level": 2, "description": "Read a file from the filesystem"},
+    {"name": "Write",      "altitude": "os",       "level": 3, "description": "Write a file to the filesystem"},
+    {"name": "Edit",       "altitude": "os",       "level": 3, "description": "Edit a file with string replacements"},
+    {"name": "Glob",       "altitude": "os",       "level": 1, "description": "Find files by glob pattern"},
+    {"name": "Grep",       "altitude": "os",       "level": 1, "description": "Search file contents by regex"},
+    {"name": "Bash",       "altitude": "os",       "level": 5, "description": "Execute a shell command"},
+    {"name": "Agent",      "altitude": "semantic", "level": 7, "description": "Spawn a sub-agent"},
+    {"name": "WebSearch",  "altitude": "semantic", "level": 2, "description": "Search the web"},
+    {"name": "WebFetch",   "altitude": "semantic", "level": 2, "description": "Fetch a URL"}
+  ]
+}
