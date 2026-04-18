@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/ducklog/__init__.py
+src/ducklog/compiler.py
+src/ducklog.egg-info/PKG-INFO
+src/ducklog.egg-info/SOURCES.txt
+src/ducklog.egg-info/dependency_links.txt
+src/ducklog.egg-info/requires.txt
+src/ducklog.egg-info/top_level.txt
+tests/test_compiler.py
+tests/test_roundtrip.py

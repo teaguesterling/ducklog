@@ -1,0 +1,25 @@
+[project]
+name = "ducklog"
+version = "0.1.0"
+description = "Policy as a database. Compile umwelt views to queryable DuckDB schemas."
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "umwelt>=0.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"

@@ -1,0 +1,6 @@
+duckdb>=1.0
+umwelt>=0.5
+
+[dev]
+pytest>=8.0
+ruff
