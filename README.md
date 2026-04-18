@@ -99,7 +99,10 @@ Round-trip tests verify the full pipeline: parse `.umw` → compile → DuckDB �
 
 | Document | What it covers |
 |---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Three-layer architecture (materialized/live/derived), compilation, resolution, integration patterns |
 | [`docs/compiler.md`](docs/compiler.md) | Selector-to-SQL compilation rules, AST node → SQL mapping |
+| [`docs/consumers.md`](docs/consumers.md) | How to read policy from a ducklog database in your tool |
+| [`docs/providers.md`](docs/providers.md) | How to bring world state into the database (filesystem, tools, modes, custom) |
 | [`docs/rosetta-stone.md`](docs/rosetta-stone.md) | Rosetta Stone: umwelt CSS ↔ SQL ↔ Datalog with 7 worked examples |
 | [`schema/policy.sql`](schema/policy.sql) | Full DDL: entities, cascade, resolution, hierarchy, verification assertions |
 | [`schema/seed-vocabulary.sql`](schema/seed-vocabulary.sql) | umwelt's registered taxa + entity types + property types as INSERT statements |
