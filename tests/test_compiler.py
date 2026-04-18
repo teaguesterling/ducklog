@@ -30,12 +30,12 @@ class TestTypeSelectors:
     def test_bare_tool_matches_all_tools(self, populated_db):
         sql = compile_selector(parse_selector("tool"))
         ids = _query_ids(populated_db, sql)
-        assert ids == {40, 41, 42, 43, 44}
+        assert ids == {40, 41, 42, 43, 44, 45, 46}
 
     def test_bare_mode_matches_all_modes(self, populated_db):
         sql = compile_selector(parse_selector("mode"))
         ids = _query_ids(populated_db, sql)
-        assert ids == {50, 51, 52, 53}
+        assert ids == {50, 51, 52, 53, 54}
 
     def test_bare_resource_matches_all_resources(self, populated_db):
         sql = compile_selector(parse_selector("resource"))
@@ -46,7 +46,7 @@ class TestTypeSelectors:
         sql = compile_selector(parse_selector("tool"))
         ids = _query_ids(populated_db, sql)
         # No file, dir, mode, etc. should appear
-        assert all(40 <= i <= 44 for i in ids)
+        assert all(40 <= i <= 46 for i in ids)
 
 
 # ============================================================================
@@ -108,7 +108,7 @@ class TestAttributeSelectors:
     def test_attribute_on_tool(self, populated_db):
         sql = compile_selector(parse_selector('tool[altitude="os"]'))
         ids = _query_ids(populated_db, sql)
-        assert ids == {40, 41, 42, 43}  # Read, Edit, Bash, Grep — not Agent
+        assert ids == {40, 41, 42, 43, 45, 46}  # Read, Edit, Bash, Grep, Glob, Write — not Agent
 
     def test_resource_kind_attribute(self, populated_db):
         sql = compile_selector(parse_selector('resource[kind="memory"]'))
@@ -153,7 +153,7 @@ class TestCompoundSelectors:
         sql = compile_selector(parse_selector("mode.implement tool"))
         ids = _query_ids(populated_db, sql)
         # mode.implement exists → context holds → all tools match
-        assert ids == {40, 41, 42, 43, 44}
+        assert ids == {40, 41, 42, 43, 44, 45, 46}
 
     def test_two_axis_mode_tool_with_attr(self, populated_db):
         """mode.implement tool[name="Bash"] → just Bash, gated by mode."""
@@ -171,7 +171,7 @@ class TestCompoundSelectors:
         """principal#Teague tool → all tools, gated by principal existing."""
         sql = compile_selector(parse_selector("principal#Teague tool"))
         ids = _query_ids(populated_db, sql)
-        assert ids == {40, 41, 42, 43, 44}
+        assert ids == {40, 41, 42, 43, 44, 45, 46}
 
     def test_two_axis_principal_nonexistent(self, populated_db):
         """principal#Nobody tool → principal doesn't exist → no matches."""

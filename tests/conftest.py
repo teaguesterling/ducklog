@@ -63,12 +63,15 @@ def populated_db(db):
             (42, 'capability', 'tool', 'Bash',           NULL, MAP{'name':'Bash', 'altitude':'os', 'level':'5'}, NULL),
             (43, 'capability', 'tool', 'Grep',           NULL, MAP{'name':'Grep', 'altitude':'os', 'level':'1'}, NULL),
             (44, 'capability', 'tool', 'Agent',          NULL, MAP{'name':'Agent', 'altitude':'semantic', 'level':'7'}, NULL),
+            (45, 'capability', 'tool', 'Glob',           NULL, MAP{'name':'Glob', 'altitude':'os', 'level':'1'}, NULL),
+            (46, 'capability', 'tool', 'Write',          NULL, MAP{'name':'Write', 'altitude':'os', 'level':'3'}, NULL),
 
             -- state: modes
-            (50, 'state', 'mode', NULL, ['implement'],       MAP{'writable':'src/, lib/'}, NULL),
-            (51, 'state', 'mode', NULL, ['test'],            MAP{'writable':'tests/'}, NULL),
-            (52, 'state', 'mode', NULL, ['explore'],         MAP{}, NULL),
-            (53, 'state', 'mode', NULL, ['implement','tdd'], MAP{'writable':'src/, tests/'}, NULL),
+            (50, 'state', 'mode', NULL, ['implement'],       MAP{'writable':'src/, lib/', 'strategy':''}, NULL),
+            (51, 'state', 'mode', NULL, ['test'],            MAP{'writable':'tests/', 'strategy':'Write tests for expected behavior, not current behavior.'}, NULL),
+            (52, 'state', 'mode', NULL, ['explore'],         MAP{'writable':'', 'strategy':'Map the territory before making changes.'}, NULL),
+            (53, 'state', 'mode', NULL, ['implement','tdd'], MAP{'writable':'src/, tests/', 'strategy':''}, NULL),
+            (54, 'state', 'mode', NULL, ['review'],          MAP{'writable':'', 'strategy':'Read everything, then verify with tests.'}, NULL),
 
             -- principal
             (60, 'principal', 'principal', 'Teague', NULL, MAP{'name':'Teague'}, NULL),
