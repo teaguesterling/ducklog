@@ -1,1 +1,3 @@
 examples/compile/world.duckdb
+__pycache__/
+*.egg-info/
