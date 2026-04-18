@@ -3,13 +3,33 @@ name = "ducklog"
 version = "0.1.0"
 description = "Policy as a database. Compile umwelt views to queryable DuckDB schemas."
 requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Teague Sterling"}]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Database",
+]
 dependencies = [
     "duckdb>=1.0",
-    "umwelt>=0.5",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff"]
+umwelt = ["umwelt>=0.5"]
+dev = ["pytest>=8.0", "ruff", "umwelt>=0.5"]
+
+[project.urls]
+Repository = "https://github.com/teaguesterling/ducklog"
+Documentation = "https://github.com/teaguesterling/ducklog/tree/main/docs"
+Issues = "https://github.com/teaguesterling/ducklog/issues"
 
 [build-system]
 requires = ["setuptools>=68"]
