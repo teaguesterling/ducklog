@@ -359,10 +359,24 @@ def create_provider_views(con: duckdb.DuckDBPyConnection,
 # ---------------------------------------------------------------------------
 
 def compile_policy_to_tables(con: duckdb.DuckDBPyConnection, view) -> None:
-    """Materialize parsed rules into tables; build cascade_candidates view from them."""
+    """Materialize parsed rules into tables; build cascade_candidates view from them.
+
+    The cascade WHERE clauses are produced by ducklog's tested AST compiler
+    (``ducklog.compiler.compile_selector``) — the *same* code path the 49
+    library tests exercise and that enforcement derives from. There is no
+    second, regex-based selector compiler: the audit view and the enforced
+    policy come from one source of truth, and any selector the resolver cannot
+    express (unknown pseudo-class / attribute operator) raises
+    ``UnsupportedSelector`` here rather than silently matching everything.
+    """
+    from ducklog.compiler import compile_selector
+
     sel_id = 0
     source_file = str(view.source_path or "")
 
+    # Build cascade_candidates branches from the parsed AST (not re-parsed text)
+    # while materializing the provenance tables in the same pass.
+    branches = []
     for rule_idx, rule in enumerate(view.rules):
         line = rule.span.line if hasattr(rule, "span") else 0
         con.execute(
@@ -370,6 +384,16 @@ def compile_policy_to_tables(con: duckdb.DuckDBPyConnection, view) -> None:
             [rule_idx, source_file, line],
         )
         rule_id = con.execute("SELECT max(id) FROM rules").fetchone()[0]
+
+        decls = []
+        for di, decl in enumerate(rule.declarations):
+            comparison = _infer_comparison(decl.property_name)
+            val = ", ".join(decl.values)
+            con.execute(
+                "INSERT INTO declarations VALUES (?, ?, ?, ?, ?)",
+                [rule_id, decl.property_name, val, comparison, di],
+            )
+            decls.append((decl.property_name, val, comparison))
 
         for selector in rule.selectors:
             sel_id += 1
@@ -380,49 +404,24 @@ def compile_policy_to_tables(con: duckdb.DuckDBPyConnection, view) -> None:
                 [sel_id, rule_id, sel_text, selector.target_taxon, spec[0], spec],
             )
 
-        for di, decl in enumerate(rule.declarations):
-            comparison = _infer_comparison(decl.property_name)
-            val = ", ".join(decl.values)
-            con.execute(
-                "INSERT INTO declarations VALUES (?, ?, ?, ?, ?)",
-                [rule_id, decl.property_name, val, comparison, di],
-            )
+            # Fail closed: compile_selector raises UnsupportedSelector for any
+            # construct it cannot faithfully express — we let it propagate and
+            # abort the build rather than emit a silently-permissive view.
+            where_sql = compile_selector(selector)
 
-    # Build cascade_candidates as a VIEW: each selector becomes one SELECT
-    # branch in a UNION ALL, joining materialized rules against live entities.
-    branches = []
-    for row in con.execute("""
-        SELECT s.id, s.rule_id, s.selector_text, s.specificity, r.rule_index,
-               r.source_file, r.source_line
-        FROM selectors s JOIN rules r ON s.rule_id = r.id
-        ORDER BY r.rule_index, s.id
-    """).fetchall():
-        sel_id, rule_id, sel_text, specificity, rule_index, src_file, src_line = row
-
-        # Get declarations for this rule
-        decls = con.execute(
-            "SELECT property_name, property_value, comparison FROM declarations WHERE rule_id = ?",
-            [rule_id],
-        ).fetchall()
-
-        # Build WHERE clause from the selector text (re-parse from AST would be cleaner;
-        # for now, retrieve the selector from the parsed view and compile)
-        where_sql = _selector_to_where(con, sel_text)
-        if where_sql is None:
-            continue
-
-        for prop_name, prop_value, comparison in decls:
-            safe_val = prop_value.replace("'", "''")
+            spec_literal = f"[{','.join(str(s) for s in spec)}]::INTEGER[]"
             safe_sel = sel_text.replace("'", "''")
-            safe_src = (src_file or "").replace("'", "''")
-            spec_literal = f"[{','.join(str(s) for s in specificity)}]::INTEGER[]"
-
-            branches.append(f"""
-    SELECT e.id AS entity_id, '{prop_name}' AS property_name,
-           '{safe_val}' AS property_value, '{comparison}' AS comparison,
-           {spec_literal} AS specificity, {rule_index} AS rule_index,
+            safe_src = source_file.replace("'", "''")
+            for prop_name, prop_value, comparison in decls:
+                safe_pn = prop_name.replace("'", "''")
+                safe_val = prop_value.replace("'", "''")
+                safe_cmp = comparison.replace("'", "''")
+                branches.append(f"""
+    SELECT e.id AS entity_id, '{safe_pn}' AS property_name,
+           '{safe_val}' AS property_value, '{safe_cmp}' AS comparison,
+           {spec_literal} AS specificity, {rule_idx} AS rule_index,
            '{safe_sel}' AS selector_text,
-           '{safe_src}' AS source_file, {src_line} AS source_line
+           '{safe_src}' AS source_file, {line} AS source_line
     FROM entities e
     WHERE {where_sql}""")
 
@@ -430,79 +429,15 @@ def compile_policy_to_tables(con: duckdb.DuckDBPyConnection, view) -> None:
         view_sql = "CREATE VIEW cascade_candidates AS\n" + "\n    UNION ALL BY NAME\n".join(branches)
         con.execute(view_sql)
     else:
-        con.execute("CREATE VIEW cascade_candidates AS SELECT NULL::INTEGER AS entity_id WHERE false")
-
-
-def _selector_to_where(con, sel_text: str) -> str | None:
-    """Convert a selector text to a SQL WHERE clause.
-
-    This is a simplified compiler — handles the common patterns.
-    A production version would walk the AST instead of re-parsing text.
-    """
-    parts = sel_text.strip().split()
-    if not parts:
-        return None
-
-    # The rightmost part is the target; earlier parts are context qualifiers.
-    target = parts[-1]
-    qualifiers = parts[:-1]
-
-    # Parse the target part
-    target_where = _parse_simple_selector_to_sql(target, "e")
-    if target_where is None:
-        return None
-
-    # Parse context qualifiers as EXISTS subqueries
-    qualifier_clauses = []
-    for q in qualifiers:
-        q_where = _parse_simple_selector_to_sql(q, "q")
-        if q_where:
-            qualifier_clauses.append(f"EXISTS (SELECT 1 FROM entities q WHERE {q_where})")
-
-    all_clauses = [target_where] + qualifier_clauses
-    return " AND ".join(all_clauses)
-
-
-def _parse_simple_selector_to_sql(sel: str, alias: str) -> str | None:
-    """Parse a single simple selector into SQL WHERE fragments."""
-    import re
-
-    clauses = []
-
-    # Extract type name (everything before #, ., or [)
-    m = re.match(r'^([a-zA-Z_][\w-]*)', sel)
-    if m:
-        type_name = m.group(1)
-        clauses.append(f"{alias}.type_name = '{type_name}'")
-
-    # Extract #id
-    m = re.search(r'#([^\s.\[]+)', sel)
-    if m:
-        clauses.append(f"{alias}.entity_id = '{m.group(1)}'")
-
-    # Extract .class
-    for m in re.finditer(r'\.([a-zA-Z_][\w-]*)', sel):
-        clauses.append(f"list_contains({alias}.classes, '{m.group(1)}')")
-
-    # Extract [attr op "value"] patterns
-    for m in re.finditer(r'\[(\w[\w-]*)(\^=|\$=|\*=|~=|\|=|=)"?([^"\]]*)"?\]', sel):
-        attr_name, op, value = m.group(1), m.group(2), m.group(3)
-        col = f"{alias}.attributes['{attr_name}']"
-        if op == "=":
-            clauses.append(f"{col} = '{value}'")
-        elif op == "^=":
-            clauses.append(f"{col} LIKE '{value}%'")
-        elif op == "$=":
-            clauses.append(f"{col} LIKE '%{value}'")
-        elif op == "*=":
-            clauses.append(f"{col} LIKE '%{value}%'")
-
-    # Extract bare [attr] (presence check)
-    for m in re.finditer(r'\[(\w+)\](?!=)', sel):
-        if not re.search(rf'\[{m.group(1)}[=^$*~|]', sel):
-            clauses.append(f"{alias}.attributes['{m.group(1)}'] IS NOT NULL")
-
-    return " AND ".join(clauses) if clauses else None
+        con.execute("""
+            CREATE VIEW cascade_candidates AS
+            SELECT NULL::INTEGER AS entity_id, NULL::VARCHAR AS property_name,
+                   NULL::VARCHAR AS property_value, NULL::VARCHAR AS comparison,
+                   NULL::INTEGER[] AS specificity, NULL::INTEGER AS rule_index,
+                   NULL::VARCHAR AS selector_text, NULL::VARCHAR AS source_file,
+                   NULL::INTEGER AS source_line
+            WHERE FALSE
+        """)
 
 
 # ---------------------------------------------------------------------------
