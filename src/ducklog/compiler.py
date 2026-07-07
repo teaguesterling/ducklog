@@ -16,6 +16,15 @@ if TYPE_CHECKING:
     from umwelt.ast import ComplexSelector, CompoundPart, SimpleSelector, View
 
 
+class UnsupportedSelector(ValueError):
+    """A selector construct the resolver cannot faithfully express in SQL.
+
+    Raised (fail closed) instead of silently dropping the constraint, which
+    would collapse the selector to match every entity of the target type and
+    make the compiled audit view diverge from what enforcement actually does.
+    """
+
+
 def compile_selector(selector: ComplexSelector) -> str:
     """Compile a ComplexSelector to a SQL WHERE clause.
 
@@ -56,7 +65,8 @@ def _compile_simple(simple: SimpleSelector, alias: str) -> str:
     clauses = []
 
     if simple.type_name and simple.type_name != "*":
-        clauses.append(f"{alias}.type_name = '{simple.type_name}'")
+        safe_type = simple.type_name.replace("'", "''")
+        clauses.append(f"{alias}.type_name = '{safe_type}'")
 
     if simple.id_value is not None:
         safe_id = simple.id_value.replace("'", "''")
@@ -70,9 +80,9 @@ def _compile_simple(simple: SimpleSelector, alias: str) -> str:
         clauses.append(_compile_attr_filter(attr, alias))
 
     for pseudo in simple.pseudo_classes:
-        clause = _compile_pseudo(pseudo, alias)
-        if clause:
-            clauses.append(clause)
+        # _compile_pseudo raises on anything it cannot express (fail closed):
+        # a dropped constraint would collapse the selector to match everything.
+        clauses.append(_compile_pseudo(pseudo, alias))
 
     if not clauses:
         return "TRUE"
@@ -80,47 +90,90 @@ def _compile_simple(simple: SimpleSelector, alias: str) -> str:
 
 
 def _compile_attr_filter(attr, alias: str) -> str:
-    """Compile an AttrFilter to a SQL expression."""
-    col = f"{alias}.attributes['{attr.name}']"
+    """Compile an AttrFilter to a SQL expression.
+
+    Raises UnsupportedSelector for any operator we cannot express, rather than
+    emitting a permissive clause (fail closed).
+    """
+    safe_name = attr.name.replace("'", "''")
+    col = f"{alias}.attributes['{safe_name}']"
     if attr.op is None:
         return f"{col} IS NOT NULL"
     safe_val = (attr.value or "").replace("'", "''")
     if attr.op == "=":
         return f"{col} = '{safe_val}'"
     if attr.op == "^=":
-        return f"{col} LIKE '{safe_val}%'"
+        return f"{col} LIKE '{_escape_like(safe_val)}%' ESCAPE '\\'"
     if attr.op == "$=":
-        return f"{col} LIKE '%{safe_val}'"
+        return f"{col} LIKE '%{_escape_like(safe_val)}' ESCAPE '\\'"
     if attr.op == "*=":
-        return f"{col} LIKE '%{safe_val}%'"
+        return f"{col} LIKE '%{_escape_like(safe_val)}%' ESCAPE '\\'"
     if attr.op == "~=":
         return f"list_contains(string_split({col}, ' '), '{safe_val}')"
     if attr.op == "|=":
-        return f"({col} = '{safe_val}' OR {col} LIKE '{safe_val}-%')"
-    return "TRUE"
+        return (
+            f"({col} = '{safe_val}' OR "
+            f"{col} LIKE '{_escape_like(safe_val)}-%' ESCAPE '\\')"
+        )
+    raise UnsupportedSelector(
+        f"unsupported attribute operator {attr.op!r} on {attr.name!r}; "
+        f"refusing to compile (fail closed)"
+    )
 
 
-def _compile_pseudo(pseudo, alias: str) -> str | None:
-    """Compile a pseudo-class to a SQL expression."""
+def _compile_pseudo(pseudo, alias: str) -> str:
+    """Compile a pseudo-class to a SQL expression.
+
+    Raises UnsupportedSelector for any pseudo-class other than :glob. Silently
+    dropping it would collapse the selector to match every entity of the target
+    type — a fail-open audit view that no longer matches enforcement.
+    """
     if pseudo.name == "glob":
         pattern = (pseudo.argument or "").strip().strip("'\"")
         sql_pattern = _glob_to_like(pattern)
-        return f"{alias}.attributes['path'] LIKE '{sql_pattern}'"
-    return None
+        return f"{alias}.attributes['path'] LIKE '{sql_pattern}' ESCAPE '\\'"
+    raise UnsupportedSelector(
+        f"unsupported pseudo-class ':{pseudo.name}'; refusing to compile "
+        f"(fail closed) rather than match every {alias} entity"
+    )
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE metacharacters so a literal value matches literally.
+
+    Backslash is used as the ESCAPE character in the emitted LIKE clauses, so
+    literal `\\`, `%`, and `_` in the value must be backslash-escaped. Without
+    this, `[path*="a_b"]` would treat `_` as a single-char wildcard.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _glob_to_like(pattern: str) -> str:
     """Convert a glob pattern to a SQL LIKE pattern.
 
-    * → %  (match any sequence)
-    ? → _  (match one character)
-    ** → % (recursive match — same as * in LIKE)
+    Only glob's own wildcards become SQL wildcards; literal LIKE metacharacters
+    in the pattern are escaped (backslash is the ESCAPE char in the clause):
+
+    * / ** → %  (match any sequence)
+    ?      → _  (match one character)
+    literal % _ \\ → escaped so they match literally
     """
-    result = pattern.replace("**", "\x00")
-    result = result.replace("*", "%")
-    result = result.replace("?", "_")
-    result = result.replace("\x00", "%")
-    return result.replace("'", "''")
+    out: list[str] = []
+    i, n = 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            while i + 1 < n and pattern[i + 1] == "*":
+                i += 1  # collapse ** → * (both are recursive % in LIKE)
+            out.append("%")
+        elif c == "?":
+            out.append("_")
+        elif c in ("\\", "%", "_"):
+            out.append("\\" + c)
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out).replace("'", "''")
 
 
 def _compile_context_qualifier(simple: SimpleSelector, alias: str) -> str:
